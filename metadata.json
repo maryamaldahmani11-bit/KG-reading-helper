@@ -1,0 +1,7 @@
+{
+  "name": "KG Reading Helper",
+  "description": "An interactive web application to help kindergarten students practice their reading skills with instant feedback and encouragement. The app features voice recording, simulated speech analysis, and multilingual support in a fun, kid-friendly interface.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
