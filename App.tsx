@@ -1,9 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { GoogleGenAI, Type } from '@google/genai';
 import { lessons } from './data/lessons';
 import { useSpeechSynthesis } from './hooks/useSpeechSynthesis';
 import { useAudioRecorder } from './hooks/useAudioRecorder';
 import type { Language, WordAnalysis } from './types';
 import { MicIcon, StopIcon, PlayIcon, PauseIcon, NextIcon, PrevIcon, StarIcon, TurtleIcon, RabbitIcon } from './components/icons';
+
+// Assumes process.env.API_KEY is available in the execution environment
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 const translations = {
   en: {
@@ -18,6 +22,7 @@ const translations = {
     resume: "Resume",
     nextLesson: "Next Lesson",
     prevLesson: "Prev Lesson",
+    error: "Sorry, I couldn't understand. Please try again!",
   },
   ar: {
     title: "مساعد القراءة",
@@ -31,6 +36,7 @@ const translations = {
     resume: "استئناف",
     nextLesson: "الدرس التالي",
     prevLesson: "الدرس السابق",
+    error: "عذراً، لم أتمكن من الفهم. الرجاء المحاولة مرة أخرى!",
   }
 };
 
@@ -64,10 +70,12 @@ const ProgressBar: React.FC<{ accuracy: number }> = ({ accuracy }) => (
   </div>
 );
 
-const FeedbackDisplay: React.FC<{ text: string, word: string, language: Language }> = ({ text, word, language }) => {
+const FeedbackDisplay: React.FC<{ text: string, word: string, language: Language, isError?: boolean }> = ({ text, word, language, isError }) => {
     if(!text) return null;
     return (
-        <div className={`mt-4 p-4 rounded-2xl text-center text-xl font-semibold transition-opacity duration-300 ${word ? 'bg-yellow-200 text-yellow-800' : 'bg-green-200 text-green-800'}`}>
+        <div className={`mt-4 p-4 rounded-2xl text-center text-xl font-semibold transition-opacity duration-300 ${
+            isError ? 'bg-red-200 text-red-800' : (word ? 'bg-yellow-200 text-yellow-800' : 'bg-green-200 text-green-800')
+        }`}>
             <p dir={language === 'ar' ? 'rtl' : 'ltr'}>
                 {text} {word && <span className="font-extrabold text-2xl" dir="ltr">{word}</span>}
             </p>
@@ -92,6 +100,19 @@ const RateControl: React.FC<{ rate: number; onRateChange: (rate: number) => void
     </div>
 );
 
+const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        reader.onloadend = () => {
+            const base64data = reader.result as string;
+            resolve(base64data.split(',')[1]);
+        };
+        reader.onerror = (error) => reject(error);
+    });
+};
+
+
 export default function App() {
   const [lessonIndex, setLessonIndex] = useState(0);
   const [sentenceIndex, setSentenceIndex] = useState(0);
@@ -100,6 +121,7 @@ export default function App() {
   const [accuracy, setAccuracy] = useState(0);
   const [feedbackText, setFeedbackText] = useState('');
   const [feedbackWord, setFeedbackWord] = useState('');
+  const [isError, setIsError] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [highlightedWordIndex, setHighlightedWordIndex] = useState(-1);
   const [speechRate, setSpeechRate] = useState(0.9);
@@ -115,73 +137,98 @@ export default function App() {
     setHighlightedWordIndex(-1);
   }, [cancel]);
 
-  const handleAnalysis = useCallback(() => {
+  const handleAnalysis = useCallback(async (audioBlob: Blob) => {
     setIsAnalyzing(true);
     setFeedbackText('');
     setFeedbackWord('');
+    setIsError(false);
     setAccuracy(0);
-    
-    // Simulate speech analysis
-    setTimeout(() => {
-      const words = currentSentence.replace(/[.,?!]/g, '').split(' ');
-      let incorrectCount = 0;
-      let firstMistake = '';
+    setAnalysis(currentSentence.split(' ').map(word => ({ word, isCorrect: true })));
 
-      const newAnalysis = words.map(word => {
-        // Simple mock logic: ~20% chance of a word being incorrect
-        const isCorrect = Math.random() > 0.2;
-        if (!isCorrect) {
-          incorrectCount++;
-          if (!firstMistake) {
-            firstMistake = word;
-          }
-        }
-        return { word, isCorrect };
-      });
-      
-      // Ensure at least one mistake if not perfect, for demo purposes
-      if (incorrectCount === 0 && Math.random() > 0.1 && words.length > 2) {
-         const randomIndex = Math.floor(Math.random() * words.length);
-         newAnalysis[randomIndex].isCorrect = false;
-         firstMistake = newAnalysis[randomIndex].word;
-         incorrectCount = 1;
-      } else if (incorrectCount > 0){
-        // make sure not everything is wrong
-      } else {
-        // all correct
-        incorrectCount = 0;
-        firstMistake = '';
-        newAnalysis.forEach(w => w.isCorrect = true);
-      }
+    try {
+        const audioData = await blobToBase64(audioBlob);
 
-      setAnalysis(newAnalysis);
-      const newAccuracy = ((words.length - incorrectCount) / words.length) * 100;
-      setAccuracy(newAccuracy);
+        const prompt = `You are a reading evaluation tool for a kindergarten student. The student has recorded themselves reading a sentence. Analyze the provided audio recording and compare it to the correct sentence text below.
 
-      const langCode = language === 'ar' ? 'ar-SA' : 'en-US';
+        Correct sentence: "${currentSentence}"
 
-      if (firstMistake) {
-        setFeedbackText(t.goodTry);
-        setFeedbackWord(firstMistake);
+        Your task is to determine which words the student pronounced correctly and which they did not. Provide your analysis in a JSON format that strictly adheres to the provided schema.
+        - The 'analysis' array must contain every word from the original sentence in order.
+        - 'isCorrect' should be true if the word was pronounced correctly or is a very close approximation for a young child. It should be false for skipped, mumbled, or clearly mispronounced words.
+        - 'allCorrect' is true only if every single word is correct.
+        - 'firstMistake' should be the first word from the sentence that was marked as incorrect. If all words are correct, this should be an empty string.`;
+
+        const responseSchema = {
+            type: Type.OBJECT,
+            properties: {
+                analysis: {
+                    type: Type.ARRAY,
+                    items: {
+                        type: Type.OBJECT,
+                        properties: {
+                            word: { type: Type.STRING },
+                            isCorrect: { type: Type.BOOLEAN },
+                        },
+                        required: ["word", "isCorrect"],
+                    },
+                },
+                allCorrect: { type: Type.BOOLEAN },
+                firstMistake: { type: Type.STRING },
+            },
+            required: ["analysis", "allCorrect", "firstMistake"],
+        };
         
-        const femaleVoice = 
-          voices.find(voice => voice.lang === 'en-US' && /female|zira|susan|kathy/i.test(voice.name.toLowerCase())) ||
-          voices.find(voice => voice.lang === 'en-US');
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: {
+                parts: [
+                    { text: prompt },
+                    { inlineData: { mimeType: 'audio/wav', data: audioData } },
+                ],
+            },
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: responseSchema,
+            },
+        });
 
-        speak([
-          { text: t.goodTry, lang: langCode, rate: speechRate },
-          { text: firstMistake, lang: 'en-US', rate: 0.6, voice: femaleVoice },
-          { text: currentSentence, lang: 'en-US', rate: speechRate }
-        ]);
-      } else {
-        setFeedbackText(t.greatJob);
-        setFeedbackWord('');
-        speak([{ text: t.greatJob, lang: langCode, rate: speechRate }]);
-      }
+        const result = JSON.parse(response.text);
 
-      setIsAnalyzing(false);
-    }, 2000);
-  }, [currentSentence, language, speak, t.goodTry, t.greatJob, voices, speechRate]);
+        setAnalysis(result.analysis);
+        const correctCount = result.analysis.filter((a: WordAnalysis) => a.isCorrect).length;
+        const newAccuracy = (correctCount / result.analysis.length) * 100;
+        setAccuracy(newAccuracy);
+
+        const langCode = language === 'ar' ? 'ar-SA' : 'en-US';
+
+        if (!result.allCorrect && result.firstMistake) {
+            setFeedbackText(t.goodTry);
+            setFeedbackWord(result.firstMistake);
+
+            const femaleVoice =
+                voices.find(voice => voice.lang === 'en-US' && /female|zira|susan|kathy/i.test(voice.name.toLowerCase())) ||
+                voices.find(voice => voice.lang === 'en-US');
+
+            speak([
+                { text: t.goodTry, lang: langCode, rate: speechRate },
+                { text: result.firstMistake, lang: 'en-US', rate: 0.6, voice: femaleVoice },
+                { text: currentSentence, lang: 'en-US', rate: speechRate }
+            ]);
+        } else {
+            setFeedbackText(t.greatJob);
+            setFeedbackWord('');
+            speak([{ text: t.greatJob, lang: langCode, rate: speechRate }]);
+        }
+
+    } catch (error) {
+        console.error("Error during analysis:", error);
+        setFeedbackText(t.error);
+        setIsError(true);
+        speak([{ text: t.error, lang: language === 'ar' ? 'ar-SA' : 'en-US', rate: speechRate }]);
+    } finally {
+        setIsAnalyzing(false);
+    }
+  }, [currentSentence, language, speak, t.goodTry, t.greatJob, voices, speechRate, t.error]);
 
 
   const { isRecording, startRecording, stopRecording } = useAudioRecorder(handleAnalysis);
@@ -193,6 +240,7 @@ export default function App() {
     setAccuracy(0);
     setFeedbackText('');
     setFeedbackWord('');
+    setIsError(false);
   }, [lessonIndex, sentenceIndex, currentSentence, cancelSpeech]);
 
   const handleNavigation = (direction: 'prev' | 'next', type: 'lesson' | 'sentence') => {
@@ -281,7 +329,7 @@ export default function App() {
 
         {accuracy > 0 && <ProgressBar accuracy={accuracy} />}
         
-        <FeedbackDisplay text={feedbackText} word={feedbackWord} language={language} />
+        <FeedbackDisplay text={feedbackText} word={feedbackWord} language={language} isError={isError}/>
 
         <div className="flex flex-col sm:flex-row justify-center items-center gap-4 mt-4">
             <button 
